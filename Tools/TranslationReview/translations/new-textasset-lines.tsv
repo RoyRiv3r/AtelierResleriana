@@ -1,0 +1,9 @@
+# asset	entry id	property id	english (new lines the mod data lacks; "\n" = line break)
+SystemText	1478547022	999008199	Paid (In-App)
+SystemText	720337262	999008199	*Free Lodestar Gems are used first. Paid Lodestar Gems are used starting with Paid Lodestar Gems (In-App),\n  then Paid Lodestar Gems (Other).
+SystemText	1602916434	999008199	*Free Lodestar Gems are used first, then Paid Lodestar Gems (In-App).
+SystemText	785773573	999008199	Purchase Successful
+SystemText	1885964361	999008199	Your purchased items have been sent via in-game mail. Only Lodestar Gems are granted directly.
+SystemText	1802833900	999008199	Paid (Other)
+SystemText	1466460717	999008199	Lodestar Gems Owned
+SystemText	421201390	999008199	Notice

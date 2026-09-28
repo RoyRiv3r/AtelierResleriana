@@ -2,10 +2,13 @@
 using AtelierResleriana.MasterData;
 using AtelierResleriana.Text;
 using BepInEx;
+using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Universal.Common;
 
 namespace AtelierResleriana.Plugin.Localization
@@ -51,12 +54,16 @@ namespace AtelierResleriana.Plugin.Localization
             if (!IsLocalizableTextAsset(name))
                 return false;
 
-            // Check if any entries have localizations for this language
-            return LocalizationData.TextAssetLocalizationData[name]
-                .Any(entry => entry.Properties
-                    .Any(prop => PackedTextLocalizationTargetPropertyIds.Contains(prop.Key) &&
-                                prop.Value.Localizations.ContainsKey(locale)));
+            // The answer never changes during a run, and the game asks on every load.
+            return LocalizableTextAssetCache.GetOrAdd((name, locale), key =>
+                // Check if any entries have localizations for this language
+                LocalizationData.TextAssetLocalizationData[key.Name]
+                    .Any(entry => entry.Properties
+                        .Any(prop => PackedTextLocalizationTargetPropertyIds.Contains(prop.Key) &&
+                                    prop.Value.Localizations.ContainsKey(key.Locale))));
         }
+
+        private ConcurrentDictionary<(string Name, string Locale), bool> LocalizableTextAssetCache { get; } = new ConcurrentDictionary<(string Name, string Locale), bool>();
 
         public bool IsWhitelistedSerializedFile(string directoryPath)
         {
@@ -200,7 +207,22 @@ namespace AtelierResleriana.Plugin.Localization
                     PropertyNamingPolicy = JsonNamingPolicy.CamelCase
                 });
 
+            string overridesPath = Path.Combine(Path.GetDirectoryName(localizationDataPath), LocalizationOverrides.FileName);
+            if (File.Exists(overridesPath))
+            {
+                try
+                {
+                    var (applied, skipped) = LocalizationOverrides.Apply(localizationData, overridesPath);
+                    Plugin.Log.LogInfo($"Applied {applied} corrections from {LocalizationOverrides.FileName}" + (skipped > 0 ? $" ({skipped} did not match the data and were skipped)." : "."));
+                }
+                catch (Exception exception)
+                {
+                    Plugin.Log.LogError($"Could not apply {LocalizationOverrides.FileName}: {exception.Message}");
+                }
+            }
+
             return new LocalizationService(localizationData);
         }
+
     }
 }

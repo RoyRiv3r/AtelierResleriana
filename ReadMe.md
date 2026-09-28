@@ -27,6 +27,11 @@ The plugin works through multiple layers of interception:
 - Implements custom readers/writers for game-specific formats like PackedText
 
 This plugin represents a sophisticated approach to game localization that preserves the original game's structure while replacing text content in multiple layers of the game's architecture.
+### Changes in 2.1.1 (this fork)
+- **Loading performance.** Asset bundles are no longer copied in full on every load: only the header and file list are read from the game's stream, and a bundle is copied only when it contains text to translate. Repacking a story bundle now re-encodes only the TextAssets it changes and copies every other object through unchanged, and two quadratic loops in `SerializedFileWriter` are gone (the chapter 16 story bundle: about 5 s on the main thread before, about 110 ms after, with byte-identical output).
+- **Translation corrections** in `Resources/LocalizationOverrides.json`, applied on top of `LocalizationData.json` at load so the automatic data update does not remove them: machine translations replaced by the official global English for identical Japanese, strings left in Japanese translated (including the chapter-skip story summaries, issue #3), consistent "Part 3" / "Rerun" naming, lines the data was missing, and the game's own `tracking_id` values restored.
+- **Tools** in `Tools/TranslationReview` to rebuild and verify all of the above; see its README.
+
 ### Installation
 A separate pre-packaged zip is provided as a release on Github so extract into the appropriate directory.
 Download the zip's contents and extract it to C:\Program Files (x86)\Steam\steamapps\common\AtelierResleriana

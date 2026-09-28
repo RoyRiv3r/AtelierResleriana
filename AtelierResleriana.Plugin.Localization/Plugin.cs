@@ -49,6 +49,9 @@ namespace AtelierResleriana.Plugin.Localization
         private static ConfigEntry<int> ConfigEntryDataUpdateDownloadTimeout { get; set; }
 
         private static IDictionary<string, Il2CppStructArray<byte>> LocalizedSerializedFileCache { get; set; } = new Dictionary<string, Il2CppStructArray<byte>>();
+        // Whitelisted bundles that turned out to need no change, so later loads skip the full read.
+        private static ISet<string> UnchangedSerializedFileKeys { get; set; } = new HashSet<string>();
+        private static readonly object SerializedFileCacheLock = new object();
 
         public static string Locale => ConfigEntryLocale.Value;
 
@@ -135,35 +138,41 @@ namespace AtelierResleriana.Plugin.Localization
         {
             if (stream == null) return;
 
+            Il2CppSystem.IO.Stream originalStream = null;
             try
             {
-                Il2CppSystem.IO.Stream originalStream = stream.TryCast<Il2CppSystem.IO.Stream>();
+                originalStream = stream.TryCast<Il2CppSystem.IO.Stream>();
                 if (originalStream == null) return;
 
-                int size = (int)originalStream.Length;
-                Il2CppStructArray<byte> il2cppArray = new Il2CppStructArray<byte>(size);
-                originalStream.Read(il2cppArray);
-                originalStream.Seek(0, Il2CppSystem.IO.SeekOrigin.Begin);
+                // Only the header and directory list are needed to decide whether this bundle
+                // is one we localize, so read those straight from the game's stream instead of
+                // copying the whole bundle first.
+                // Never wrap the game's stream in an Il2Cpp BinaryReader: disposing one closes
+                // the stream even with leaveOpen, and Unity then crashes loading from it.
+                GameStreamAdapter gameStream = new GameStreamAdapter(originalStream);
+                string[] directoryPaths = BundleDirectoryReader.ReadDirectoryPaths(gameStream);
+                gameStream.Seek(0, SeekOrigin.Begin);
 
-                Il2CppSystem.IO.MemoryStream intermediateStream = new Il2CppSystem.IO.MemoryStream(il2cppArray);
-                UnityFSFileRuntimeReader unityFSFileRuntimeReader = new UnityFSFileRuntimeReader();
-                UnityFSFile runtimeUnityFSFile = unityFSFileRuntimeReader.Read(intermediateStream);
-                intermediateStream.Dispose();
-
-                string cacheKey = string.Join("|", runtimeUnityFSFile.Metadata.DirectoryInfos.Select(x => x.Path));
-                if (ConfigEntryUseSerializedFileCache.Value && LocalizedSerializedFileCache.ContainsKey(cacheKey))
+                string cacheKey = string.Join("|", directoryPaths);
+                lock (SerializedFileCacheLock)
                 {
-                    Il2CppSystem.IO.MemoryStream newStream = new Il2CppSystem.IO.MemoryStream(LocalizedSerializedFileCache[cacheKey]);
-                    stream = newStream;
-                    Log.LogInfo("Returned asset bundle from cache.");
-                    return;
+                    if (ConfigEntryUseSerializedFileCache.Value && LocalizedSerializedFileCache.TryGetValue(cacheKey, out var cachedBundle))
+                    {
+                        Il2CppSystem.IO.MemoryStream newStream = new Il2CppSystem.IO.MemoryStream(cachedBundle);
+                        stream = newStream;
+                        Log.LogDebug("Returned asset bundle from cache.");
+                        return;
+                    }
+
+                    if (UnchangedSerializedFileKeys.Contains(cacheKey))
+                    {
+                        return;
+                    }
                 }
 
                 bool anyWhitelisted = false;
-                foreach (var directoryInfo in runtimeUnityFSFile.Metadata.DirectoryInfos)
+                foreach (string directoryPath in directoryPaths)
                 {
-                    string directoryPath = directoryInfo.Path;
-                    
                     if (directoryPath.StartsWith("CAB-") && !Path.HasExtension(directoryPath))
                     {
                         if (!LocalizationService.IsWhitelistedSerializedFile(directoryPath))
@@ -183,13 +192,23 @@ namespace AtelierResleriana.Plugin.Localization
                     return;
                 }
 
-                byte[] bytes = il2cppArray.ToBytes();
+                byte[] bytes = new byte[gameStream.Length];
+                gameStream.Seek(0, SeekOrigin.Begin);
+                for (int total = 0, read; total < bytes.Length; total += read)
+                {
+                    read = gameStream.Read(bytes, total, bytes.Length - total);
+                    if (read <= 0)
+                    {
+                        throw new EndOfStreamException($"Asset bundle stream ended at {total} of {bytes.Length} bytes.");
+                    }
+                }
 
                 using MemoryStream managedStream = new MemoryStream(bytes);
                 UnityFSFileReader unityFSFileReader = new UnityFSFileReader();
                 UnityFSFile unityFSFile = unityFSFileReader.Read(managedStream);
 
                 bool modified = false;
+                int localizedTextAssets = 0;
 
                 IList<UnityFSFileDirectory> modifiedDirectories = new List<UnityFSFileDirectory>();
 
@@ -216,19 +235,22 @@ namespace AtelierResleriana.Plugin.Localization
                         for (int i = 0; i < serializedFile.Objects.Length; i++)
                         {
                             var originalObject = serializedFile.Objects[i];
-                            var serializedObject = serializedFile.GetSerializedObject(originalObject);
 
+                            // Every object is copied through as its original bytes unless it is a
+                            // TextAsset we actually localize: decoding and re-encoding all ~18,000
+                            // objects of a story bundle took seconds on the game's main thread.
                             var writerObject = new SerializedFileWriter.SerializedFileObject
                             {
                                 PathId = originalObject.PathId,
                                 TypeId = originalObject.TypeId,
-                                SerializedObject = serializedObject,
+                                RawData = originalObject.Data,
                                 DataIndex = i  // Preserve order
                             };
 
                             // Check if it's a TextAsset that needs localization
                             if (originalObject.ClassId == ClassIds.TextAsset)
                             {
+                                var serializedObject = serializedFile.GetSerializedObject(originalObject);
                                 byte[] scriptBytes = (byte[])serializedObject["m_Script"];
                                 string name = Encoding.ASCII.GetString((byte[])serializedObject["m_Name"]);
 
@@ -240,9 +262,10 @@ namespace AtelierResleriana.Plugin.Localization
                                         // Update the serialized object with the localized bytes
                                         serializedObject["m_Script"] = localizedBytes;
                                         writerObject.SerializedObject = serializedObject;
+                                        writerObject.RawData = null;
                                         anyObjectModified = true;
 
-                                        Log.LogInfo($"Localized TextAsset '{name}'.");
+                                        localizedTextAssets++;
                                     }
                                 }
                             }
@@ -309,19 +332,34 @@ namespace AtelierResleriana.Plugin.Localization
 
                     if (ConfigEntryUseSerializedFileCache.Value)
                     {
-                        LocalizedSerializedFileCache.Add(cacheKey, newIl2cppArray);
+                        lock (SerializedFileCacheLock)
+                        {
+                            LocalizedSerializedFileCache[cacheKey] = newIl2cppArray;
+                        }
                     }
 
                     Il2CppSystem.IO.MemoryStream newStream = new Il2CppSystem.IO.MemoryStream(newIl2cppArray);
 
                     // Replace the original stream
                     stream = newStream;
-                    Log.LogInfo("Localized AssetBundle.");
+                    Log.LogInfo($"Localized AssetBundle ({localizedTextAssets} text assets).");
+                }
+                else
+                {
+                    lock (SerializedFileCacheLock)
+                    {
+                        UnchangedSerializedFileKeys.Add(cacheKey);
+                    }
                 }
             }
             catch (Exception exception)
             {
                 Log.LogError($"Error in AssetBundleLoadFromStreamPrefix: {exception.Message}");
+            }
+            finally
+            {
+                // Whatever happened above, hand the game its stream back at the start.
+                try { originalStream?.Seek(0, Il2CppSystem.IO.SeekOrigin.Begin); } catch { }
             }
         }
 
@@ -473,6 +511,13 @@ namespace AtelierResleriana.Plugin.Localization
                 {
                     string name = textAsset.name;
 
+                    // Check the name before touching textAsset.bytes, which copies the whole
+                    // asset into a new Il2Cpp array on every load.
+                    if (!LocalizationService.IsLocalizableTextAsset(name, Locale))
+                    {
+                        return;
+                    }
+
                     TextAsset localizedTextAsset;
                     if (LocalizationService.TryLocalize(name, Locale, textAsset, out localizedTextAsset))
                     {
@@ -546,11 +591,8 @@ namespace AtelierResleriana.Plugin.Localization
                 {
                     try
                     {
-                        LocalizationData localizationData = JsonSerializer.Deserialize<LocalizationData>(File.ReadAllText(filePath), new JsonSerializerOptions()
-                        {
-                            PropertyNamingPolicy = JsonNamingPolicy.CamelCase
-                        });
-                        shouldUpdate = localizationDataVersions.Any(x => x.Version > localizationData.Version);
+                        long localVersion = ReadLocalizationDataVersion(filePath);
+                        shouldUpdate = localizationDataVersions.Any(x => x.Version > localVersion);
                     }
                     catch
                     {
@@ -633,6 +675,36 @@ namespace AtelierResleriana.Plugin.Localization
                 Log.LogWarning("Failed to retrieve data versions.");
                 return;
             }
+        }
+
+        // Reads only the top-level "version" of the localization data, rather than
+        // deserializing the whole file (tens of MB) just to compare one number; the
+        // service deserializes it again right after this check anyway.
+        private static long ReadLocalizationDataVersion(string filePath)
+        {
+            Utf8JsonReader reader = new Utf8JsonReader(File.ReadAllBytes(filePath), new JsonReaderOptions
+            {
+                AllowTrailingCommas = true,
+                CommentHandling = JsonCommentHandling.Skip
+            });
+
+            if (!reader.Read() || reader.TokenType != JsonTokenType.StartObject)
+            {
+                throw new FormatException("Localization data is not a JSON object.");
+            }
+
+            while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
+            {
+                bool isVersion = reader.ValueTextEquals("version") || reader.ValueTextEquals("Version");
+                reader.Read();
+                if (isVersion)
+                {
+                    return reader.GetInt64();
+                }
+                reader.Skip();
+            }
+
+            throw new FormatException("Localization data has no version.");
         }
 
         private record class LocalizationDataVersion

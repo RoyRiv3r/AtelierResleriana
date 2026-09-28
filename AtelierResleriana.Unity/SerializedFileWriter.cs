@@ -74,25 +74,37 @@ namespace AtelierResleriana.Unity
             // Create a dictionary to store offsets and sizes keyed by object
             var objectDataInfo = new Dictionary<SerializedFileObject, (long offset, uint size)>();
 
-            // First pass: Write the object data to the data stream in DataIndex order
-            foreach (var obj in objects.OrderBy(o => o.DataIndex))
+            // First pass: Write the object data to the data stream in DataIndex order.
+            // Sorted once: re-sorting every object to find the last one made this quadratic
+            // (seconds for a story bundle with ~18,000 objects).
+            SerializedFileObject[] dataOrder = objects.OrderBy(o => o.DataIndex).ToArray();
+            SerializedFileObject lastObject = dataOrder.LastOrDefault();
+            foreach (var obj in dataOrder)
             {
                 long offset = dataStream.Position;
 
-                SerializedFileType type = types[obj.TypeId];
-                SerializedObjectWriter serializedObjectWriter = new SerializedObjectWriter(new SerializedObjectWriter.Options()
+                if (obj.RawData != null)
                 {
-                    IsBigEndian = IsBigEndian
-                });
+                    // Unchanged object: copy its original bytes instead of re-encoding them.
+                    dataStream.Write(obj.RawData, 0, obj.RawData.Length);
+                }
+                else
+                {
+                    SerializedFileType type = types[obj.TypeId];
+                    SerializedObjectWriter serializedObjectWriter = new SerializedObjectWriter(new SerializedObjectWriter.Options()
+                    {
+                        IsBigEndian = IsBigEndian
+                    });
 
-                serializedObjectWriter.Write(obj.SerializedObject, type.Node).CopyTo(dataStream);
+                    serializedObjectWriter.Write(obj.SerializedObject, type.Node).CopyTo(dataStream);
+                }
                 uint size = (uint)(dataStream.Position - offset);
 
                 // Store the offset and size for this object
                 objectDataInfo[obj] = (offset, size);
 
                 // Align for the next object, if not the last one
-                if (obj != objects.OrderBy(o => o.DataIndex).Last())
+                if (obj != lastObject)
                 {
                     dataStreamWriter.Align(8);
                 }
@@ -234,18 +246,7 @@ namespace AtelierResleriana.Unity
             CollectNodes(node, nodes);
 
             // Create string buffer manager with common strings
-            var commonStrings = TypePackage.Instance.TypeTreeBlob.CommonString
-                .GetStrings(TypePackage.Instance.TypeTreeBlob.StringBuffer)
-                .Select((str, index) =>
-                {
-                    int offset = 0;
-                    for (int i = 0; i < index; i++)
-                    {
-                        offset += Encoding.UTF8.GetByteCount(TypePackage.Instance.TypeTreeBlob.CommonString.GetStrings(TypePackage.Instance.TypeTreeBlob.StringBuffer).ElementAt(i)) + 1;
-                    }
-                    return new KeyValuePair<string, uint>(str, (uint)offset);
-                })
-                .ToDictionary(x => x.Key, x => x.Value);
+            var commonStrings = CommonStringOffsets.Value;
 
             var stringManager = new StringBufferManager(commonStrings);
 
@@ -282,6 +283,22 @@ namespace AtelierResleriana.Unity
                 binaryWriter.WriteNullTerminatedString(strOffset.Key, Encoding.UTF8);
             }
         }
+
+        // Offsets of Unity's common strings: each is the running total of the UTF-8 lengths (plus
+        // terminator) of the strings before it. Computed once; it used to be recomputed from
+        // scratch for every string of every type, which made writing a file's types quadratic.
+        // Read-only: StringBufferManager only looks strings up in it.
+        private static readonly System.Lazy<Dictionary<string, uint>> CommonStringOffsets = new System.Lazy<Dictionary<string, uint>>(() =>
+        {
+            var offsets = new Dictionary<string, uint>();
+            uint offset = 0;
+            foreach (string str in TypePackage.Instance.TypeTreeBlob.CommonString.GetStrings(TypePackage.Instance.TypeTreeBlob.StringBuffer))
+            {
+                offsets.Add(str, offset);
+                offset += (uint)Encoding.UTF8.GetByteCount(str) + 1;
+            }
+            return offsets;
+        });
 
         private void CollectNodes(SerializedFileTypeTreeNode node, List<SerializedFileTypeTreeNode> nodes)
         {
@@ -353,6 +370,8 @@ namespace AtelierResleriana.Unity
             public int TypeId { get; set; }
             public int DataIndex { get; set; }
             public SerializedObject SerializedObject { get; set; }
+            /// <summary>Original object bytes, written as-is when set (SerializedObject is then ignored).</summary>
+            public byte[] RawData { get; set; }
         }
     }
 }

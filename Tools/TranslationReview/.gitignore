@@ -1,0 +1,12 @@
+# Extracted game data and generated output: regenerate with the tools, never commit.
+jp/
+ui/
+story-out/
+report/
+barrelwisdom/
+roundtrip/dump/
+todo/
+pairs.json
+*.bin
+bin/
+obj/
